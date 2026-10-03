@@ -1,0 +1,6 @@
+{
+  "name": "Tiffin CRM",
+  "description": "Simple and powerful CRM, subscription manager, and daily delivery tracker for tiffin service providers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
