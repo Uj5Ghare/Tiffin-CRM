@@ -5,8 +5,41 @@
 
 ---
 
+## 📸 App Screenshots
+
+The app is a five-tab, fully offline handheld tool: **Desk** (dashboard), **Dispatch**, **Clients**, **Ledger** and **Plans**.
+
+### Flow 1 · Morning Operations
+
+| 📊 Desk — Daily Dashboard | 🛵 Dispatch — Daily Sheet | 🚚 Dispatch — Route Cards |
+|:---:|:---:|:---:|
+| <img src="assets/images/Screenshot_20261003-225843.jpg" width="230" alt="Desk dashboard showing a 75% daily progress ring and 15 tiffins dispatched"> | <img src="assets/images/Screenshot_20261003-225937.jpg" width="230" alt="Daily Dispatch Sheet with date picker, search, shift filters and 7 of 15 delivered"> | <img src="assets/images/Screenshot_20261003-225922.jpg" width="230" alt="Dispatch cards for Deepa Shah and Suresh Kumar with Map, Call and WhatsApp actions"> |
+| **Ring meter at 75%** with *15 Total Tiffins Dispatched* and a *+5 vs yesterday* delta. | **One sheet per date** (2026-10-03), search by name/phone/area, **Lunch / Dinner** filters and a **7 / 15 Delivered** progress bar. | **Every drop is actionable** — meal count, diet tag (*Pure Jain*, *Call before coming*), then **Maps / Call / WhatsApp / Delivered**. |
+
+### Flow 2 · Customer Directory & Onboarding
+
+| 👥 Clients — Directory | ➕ Clients — Add Customer |
+|:---:|:---:|
+| <img src="assets/images/Screenshot_20261003-230001.jpg" width="230" alt="Customer Directory grouped by locality with Veg and Non-Veg filters"> | <img src="assets/images/Screenshot_20261003-230004.jpg" width="230" alt="Add New Customer form with name, phone, area, address, diet preference and notes"> |
+| **12 clients** grouped by locality (**Koramangala**, **HSR Layout**), filtered by **Veg / Non-Veg**, each row showing plan + meals consumed and a **Record Payment** shortcut. | One screen captures name, phone, area/route, full address, **Pure Veg / Non-Veg / Jain** preference and delivery instructions. |
+
+### Flow 3 · Ledger & Meal Plans
+
+| 💰 Ledger — Payment Ledger | 🍛 Plans — Catalog | 🍛 Plans — Create Plan |
+|:---:|:---:|:---:|
+| <img src="assets/images/Screenshot_20261003-230022.jpg" width="230" alt="Payment Ledger showing collected amount, pending dues and record payment actions"> | <img src="assets/images/Screenshot_20261003-230106.jpg" width="230" alt="Meal Plans catalog listing Monthly Lunch Only, Non-Veg Deluxe and Weekly Trial Pack"> | <img src="assets/images/Screenshot_20261003-230116.jpg" width="230" alt="Create Plan form with name, description, price, total meals and service shift"> |
+| **₹19,700 collected** vs **₹8,400 pending**, split into *Payments (5)* and *Pending Dues (3)*, each due row one tap from **Record Payment**. | The plan catalog with price, meal counts and **diet / duration** filters — *Monthly Lunch Only*, *Non-Veg Deluxe*, *Weekly Trial Pack*. | Build a reusable plan once (**price**, **total meals**, **Lunch / Dinner** shift) and assign it to customers instead of retyping. |
+
+> 💡 Prefer reading the app in context? The same five journeys are narrated step by step in [User Flow Explanation](#-user-flow-explanation).
+
+---
+
 ## 📑 Table of Contents
 
+- [App Screenshots](#-app-screenshots)
+  - [Flow 1 · Morning Operations](#flow-1--morning-operations)
+  - [Flow 2 · Customer Directory & Onboarding](#flow-2--customer-directory--onboarding)
+  - [Flow 3 · Ledger & Meal Plans](#flow-3--ledger--meal-plans)
 - [Project Overview](#-project-overview)
 - [Key Features](#-key-features)
 - [Architecture & Tech Stack](#-architecture--tech-stack)
