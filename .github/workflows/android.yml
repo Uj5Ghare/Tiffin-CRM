@@ -1,0 +1,515 @@
+name: Android Build
+
+# Requires these GitHub Environments (each holding the secrets listed below):
+#   STAGING -> GOOGLE_PLAY_SERVICE_ACCOUNT_JSON, ANDROID_PACKAGE_NAME,
+#              ANDROID_KEYSTORE_BASE64 / _PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+#   PREPROD -> same as STAGING
+#   PROD    -> same as STAGING (production uses the production Play track)
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Target environment (selects Play track + artifact path)'
+        required: true
+        type: choice
+        default: 'staging'
+        options:
+          - staging
+          - preprod
+          - production
+      version_bump:
+        description: 'Version bump applied on top of app/build.gradle.kts'
+        required: true
+        type: choice
+        default: 'patch'
+        options:
+          - none
+          - patch
+          - minor
+          - major
+      run_tests:
+        description: 'Run unit/Robolectric tests + Roborazzi screenshot verification'
+        required: false
+        type: boolean
+        default: true
+
+# Deploys are never cancelled mid-flight; a newer run waits its turn.
+concurrency:
+  group: tiffin-crm-android-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read   # notify reads the run start time for the duration
+  contents: write # needed to create GitHub releases and tags
+
+env:
+  JAVA_VERSION: '17'
+  APP_NAME: tiffin-crm
+  APP_ENV: ${{ inputs.env }}
+  GH_ENVIRONMENT: ${{ inputs.env == 'production' && 'PROD' || (inputs.env == 'preprod' && 'PREPROD' || 'STAGING') }}
+  PLAY_TRACK: ${{ inputs.env == 'production' && 'production' || (inputs.env == 'preprod' && 'beta' || 'internal') }}
+  FASTLANE_SKIP_UPDATE_CHECK: '1'
+  FASTLANE_OPT_OUT_USAGE: '1'
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+  S3_APP_ROOT: tiffin-crm/app
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  SLACK_PRODUCT_LABEL: Tiffin CRM
+
+jobs:
+  prepare:
+    name: Resolve version and target
+    runs-on: self-hosted
+    outputs:
+      version_name: ${{ steps.target.outputs.version_name }}
+      version_code: ${{ steps.target.outputs.version_code }}
+      app_env: ${{ steps.target.outputs.app_env }}
+      play_track: ${{ steps.target.outputs.play_track }}
+      github_environment: ${{ steps.target.outputs.github_environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Resolve version, environment and Play track
+        id: target
+        env:
+          VERSION_BUMP: ${{ inputs.version_bump }}
+        run: |
+          set -euo pipefail
+
+          GRADLE_FILE="app/build.gradle.kts"
+          CURRENT_NAME="$(sed -nE 's/^[[:space:]]*versionName.*\?:[[:space:]]*"([^"]+)".*/\1/p' "$GRADLE_FILE" | head -n1)"
+          CURRENT_CODE="$(sed -nE 's/^[[:space:]]*versionCode.*\?:[[:space:]]*([0-9]+).*/\1/p' "$GRADLE_FILE" | head -n1)"
+          CURRENT_NAME="${CURRENT_NAME:-1.0}"
+          CURRENT_CODE="${CURRENT_CODE:-1}"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_NAME"
+          MAJOR="${MAJOR:-0}"
+          MINOR="${MINOR:-0}"
+          PATCH="${PATCH:-0}"
+
+          case "$VERSION_BUMP" in
+            none)  NEXT_NAME="$CURRENT_NAME"; NEXT_CODE="$CURRENT_CODE" ;;
+            patch) NEXT_NAME="${MAJOR}.${MINOR}.$((PATCH + 1))"; NEXT_CODE="$((CURRENT_CODE + 1))" ;;
+            minor) NEXT_NAME="${MAJOR}.$((MINOR + 1)).0";           NEXT_CODE="$((CURRENT_CODE + 1))" ;;
+            major) NEXT_NAME="$((MAJOR + 1)).0.0";                   NEXT_CODE="$((CURRENT_CODE + 1))" ;;
+            *)     echo "::error::Unsupported version bump '$VERSION_BUMP'"; exit 1 ;;
+          esac
+
+          case "$APP_ENV" in
+            production) PLAY_TRACK="production"; GITHUB_ENVIRONMENT="PROD" ;;
+            preprod)    PLAY_TRACK="beta";      GITHUB_ENVIRONMENT="PREPROD" ;;
+            *)          PLAY_TRACK="internal";  GITHUB_ENVIRONMENT="STAGING" ;;
+          esac
+
+          {
+            echo "version_name=$NEXT_NAME"
+            echo "version_code=$NEXT_CODE"
+            echo "app_env=$APP_ENV"
+            echo "play_track=$PLAY_TRACK"
+            echo "github_environment=$GITHUB_ENVIRONMENT"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Environment:      $APP_ENV (GitHub Environment: $GITHUB_ENVIRONMENT)"
+          echo "Play track:       $PLAY_TRACK"
+          echo "Current version:  $CURRENT_NAME (code $CURRENT_CODE)"
+          echo "Build version:    $NEXT_NAME (code $NEXT_CODE)"
+          if [ "$VERSION_BUMP" = "none" ]; then
+            echo "::warning::version_bump=none - the versionCode must still be higher than the last Play upload"
+          fi
+
+  verify:
+    name: Verify secrets
+    runs-on: self-hosted
+    needs: prepare
+    environment: ${{ needs.prepare.outputs.github_environment }}
+    steps:
+      - name: Validate required secrets
+        env:
+          PLAY_KEY: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          [ -n "${PACKAGE_NAME:-}" ] || fail "ANDROID_PACKAGE_NAME is not set on the '$GH_ENVIRONMENT' environment."
+          echo "Package name: $PACKAGE_NAME"
+
+          if [ -z "${PLAY_KEY:-}" ]; then
+            fail "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is not set on the '$GH_ENVIRONMENT' environment."
+          fi
+          if echo "$PLAY_KEY" | jq -e '.client_email and .private_key' >/dev/null 2>&1; then
+            echo "Play service account: $(echo "$PLAY_KEY" | jq -r '.client_email')"
+          else
+            fail "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is not a valid service-account JSON."
+          fi
+
+          [ -n "${KEYSTORE_B64:-}" ]      || fail "ANDROID_KEYSTORE_BASE64 is not set on the '$GH_ENVIRONMENT' environment."
+          [ -n "${STORE_PASSWORD:-}" ]    || fail "ANDROID_KEYSTORE_PASSWORD is not set on the '$GH_ENVIRONMENT' environment."
+          [ -n "${KEY_ALIAS:-}" ]         || fail "ANDROID_KEY_ALIAS is not set on the '$GH_ENVIRONMENT' environment."
+          [ -n "${KEY_PASSWORD:-}" ]      || fail "ANDROID_KEY_PASSWORD is not set on the '$GH_ENVIRONMENT' environment."
+          echo "Keystore alias: $KEY_ALIAS"
+
+  build:
+    name: Build ${{ needs.prepare.outputs.app_env }} APK + AAB
+    runs-on: self-hosted
+    needs: [prepare, verify]
+    environment: ${{ needs.prepare.outputs.github_environment }}
+    env:
+      VERSION_NAME: ${{ needs.prepare.outputs.version_name }}
+      VERSION_CODE: ${{ needs.prepare.outputs.version_code }}
+      GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+    outputs:
+      apk_name: ${{ steps.artifacts.outputs.apk_name }}
+      aab_name: ${{ steps.artifacts.outputs.aab_name }}
+      apk_url: ${{ steps.s3.outputs.apk_url }}
+      aab_url: ${{ steps.s3.outputs.aab_url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+          cache-cleanup: always
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36.1 build-tools;36.0.0'
+
+      - name: Write .env for the Secrets Gradle Plugin
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DEBUG_STORE_PASSWORD: ${{ secrets.DEBUG_STORE_PASSWORD }}
+          DEBUG_KEY_PASSWORD: ${{ secrets.DEBUG_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          {
+            echo "APP_ENV=${APP_ENV}"
+            echo "APP_NAME=${APP_NAME}"
+            for KEY in GEMINI_API_KEY DEBUG_STORE_PASSWORD DEBUG_KEY_PASSWORD; do
+              if [ -n "${!KEY:-}" ]; then
+                echo "${KEY}=${!KEY}"
+              fi
+            done
+          } > .env
+          echo "Wrote .env with keys: $(cut -d= -f1 .env | paste -sd, -)"
+
+      - name: Inject google-services.json
+        if: env.GOOGLE_SERVICES_JSON != ''
+        run: |
+          set -euo pipefail
+          printf '%s' "$GOOGLE_SERVICES_JSON" > app/google-services.json
+          jq -e '.project_info.project_number and .client[0].client_info.android_client_info.package_name' \
+            app/google-services.json >/dev/null \
+            || { echo "::error::GOOGLE_SERVICES_JSON is not a valid google-services.json"; exit 1; }
+          echo "Injected google-services.json (Firebase config present in the bundle)"
+
+      - name: Inject release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          KEYSTORE_PATH="$GITHUB_WORKSPACE/my-upload-key.jks"
+          KEYSTORE_B64_FILE="$RUNNER_TEMP/keystore.b64"
+          printf '%s' "$KEYSTORE_B64" > "$KEYSTORE_B64_FILE"
+
+          if ! base64 --decode "$KEYSTORE_B64_FILE" > "$KEYSTORE_PATH" 2>/dev/null; then
+            base64 -D "$KEYSTORE_B64_FILE" > "$KEYSTORE_PATH"
+          fi
+          rm -f "$KEYSTORE_B64_FILE"
+          chmod 600 "$KEYSTORE_PATH"
+
+          if ! keytool -list -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+            echo "::error::Keystore alias '$KEY_ALIAS' could not be opened with ANDROID_KEYSTORE_PASSWORD"
+            exit 1
+          fi
+
+          {
+            echo "KEYSTORE_PATH=$KEYSTORE_PATH"
+            echo "STORE_PASSWORD=$STORE_PASSWORD"
+            echo "KEY_ALIAS=$KEY_ALIAS"
+            echo "KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "Keystore ready: $KEYSTORE_PATH (alias $KEY_ALIAS)"
+
+      - name: Run unit and screenshot tests
+        if: inputs.run_tests
+        timeout-minutes: 30
+        run: ./gradlew testDebugUnitTest verifyRoborazziDebug --stacktrace
+
+      - name: Upload test and screenshot reports
+        if: always() && inputs.run_tests
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports-${{ needs.prepare.outputs.app_env }}-${{ needs.prepare.outputs.version_code }}
+          path: |
+            app/build/reports/tests/
+            app/build/outputs/roborazzi/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Assemble release APK and AAB
+        id: build
+        timeout-minutes: 45
+        env:
+          GRADLE_OPTS: >-
+            -Dorg.gradle.daemon=true
+            -Dorg.gradle.parallel=true
+            -Dorg.gradle.caching=true
+        run: bundle exec fastlane build --verbose
+
+      - name: Compute artifact names
+        id: artifacts
+        run: |
+          set -euo pipefail
+
+          SRC_APK="${{ steps.build.outputs.apk_path }}"
+          SRC_AAB="${{ steps.build.outputs.aab_path }}"
+          [ -f "$SRC_APK" ] || { echo "::error::APK not found at '$SRC_APK'"; exit 1; }
+          [ -f "$SRC_AAB" ] || { echo "::error::AAB not found at '$SRC_AAB'"; exit 1; }
+
+          STAMP="$(date -u +'%y-%m-%d-%H-%M')"
+          APK_NAME="${APP_NAME}-${APP_ENV}-v${VERSION_NAME}-${STAMP}.apk"
+          AAB_NAME="${APP_NAME}-${APP_ENV}-v${VERSION_NAME}-${STAMP}.aab"
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          cp "$SRC_APK" "$RUNNER_TEMP/artifacts/${APK_NAME}"
+          cp "$SRC_AAB" "$RUNNER_TEMP/artifacts/${AAB_NAME}"
+
+          {
+            echo "apk_name=${APK_NAME}"
+            echo "aab_name=${AAB_NAME}"
+            echo "apk_file=$RUNNER_TEMP/artifacts/${APK_NAME}"
+            echo "aab_file=$RUNNER_TEMP/artifacts/${AAB_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "APK: $RUNNER_TEMP/artifacts/${APK_NAME}"
+          echo "AAB: $RUNNER_TEMP/artifacts/${AAB_NAME}"
+
+      - name: Stage artifacts for the Play upload job
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-${{ needs.prepare.outputs.app_env }}-${{ needs.prepare.outputs.version_code }}
+          path: ${{ runner.temp }}/artifacts/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Configure AWS credentials
+        if: env.AWS_ACCESS_KEY_ID != ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload APK and AAB to S3
+        id: s3
+        if: env.AWS_ACCESS_KEY_ID != ''
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          APK_KEY="${S3_APP_ROOT}/builds/${APP_ENV}/apk/${{ steps.artifacts.outputs.apk_name }}"
+          AAB_KEY="${S3_APP_ROOT}/builds/${APP_ENV}/aab/${{ steps.artifacts.outputs.aab_name }}"
+
+          aws s3 cp "${{ steps.artifacts.outputs.apk_file }}" "s3://${S3_BUCKET}/${APK_KEY}" \
+            --content-type "application/vnd.android.package-archive" \
+            --cache-control "public,max-age=31536000,immutable"
+          aws s3 cp "${{ steps.artifacts.outputs.aab_file }}" "s3://${S3_BUCKET}/${AAB_KEY}" \
+            --content-type "application/octet-stream" \
+            --cache-control "public,max-age=31536000,immutable"
+
+          {
+            echo "apk_url=https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${APK_KEY}"
+            echo "aab_url=https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${AAB_KEY}"
+          } >> "$GITHUB_OUTPUT"
+          echo "S3 APK: https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${APK_KEY}"
+
+      - name: Create GitHub Release
+        if: steps.artifacts.outcome == 'success'
+        continue-on-error: true
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.APP_ENV }}-v${{ env.VERSION_NAME }}-android-${{ env.VERSION_CODE }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            ${{ steps.artifacts.outputs.apk_file }}
+            ${{ steps.artifacts.outputs.aab_file }}
+          fail_on_unmatched_files: false
+          make_latest: false
+          prerelease: true
+          body: |
+            ### 📱 ${{ env.APP_NAME }} Android Build
+            | Field | Value |
+            |-------|-------|
+            | **Environment** | ${{ env.APP_ENV }} |
+            | **Version** | ${{ env.VERSION_NAME }} (code ${{ env.VERSION_CODE }}) |
+            | **Branch** | ${{ github.ref_name }} |
+            | **Commit** | ${{ github.sha }} |
+            | **📥 S3 Download (APK):** | ${{ steps.s3.outputs.apk_url }} |
+            | **📥 S3 Download (AAB):** | ${{ steps.s3.outputs.aab_url }} |
+
+      - name: Cleanup runner workspace
+        if: always()
+        run: |
+          rm -f "$GITHUB_WORKSPACE/my-upload-key.jks" "$GITHUB_WORKSPACE/.env" "$GITHUB_WORKSPACE/app/google-services.json"
+          rm -rf "$GITHUB_WORKSPACE"/*
+
+  publish:
+    name: Publish to Google Play (${{ needs.prepare.outputs.play_track }})
+    runs-on: self-hosted
+    needs: [prepare, verify, build]
+    environment: ${{ needs.prepare.outputs.github_environment }}
+    env:
+      VERSION_NAME: ${{ needs.prepare.outputs.version_name }}
+      VERSION_CODE: ${{ needs.prepare.outputs.version_code }}
+      PLAY_TRACK: ${{ needs.prepare.outputs.play_track }}
+      ANDROID_PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}
+      PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Download release AAB
+        uses: actions/download-artifact@v8
+        with:
+          name: android-${{ needs.prepare.outputs.app_env }}-${{ needs.prepare.outputs.version_code }}
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Upload AAB to Google Play
+        timeout-minutes: 30
+        env:
+          AAB_SRC: ${{ runner.temp }}/artifacts/${{ needs.build.outputs.aab_name }}
+        run: bundle exec fastlane upload --verbose
+
+      - name: Cleanup runner workspace
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE"/*
+
+  notify:
+    name: Notify Slack
+    runs-on: self-hosted
+    needs: [prepare, verify, build, publish]
+    if: always()
+    env:
+      VERSION_NAME: ${{ needs.prepare.outputs.version_name }}
+      VERSION_CODE: ${{ needs.prepare.outputs.version_code }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      PUBLISH_RESULT: ${{ needs.publish.result }}
+      APK_URL: ${{ needs.build.outputs.apk_url }}
+      AAB_URL: ${{ needs.build.outputs.aab_url }}
+    steps:
+      - name: Slack notification
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "SLACK_WEBHOOK_URL not set - skipping"
+            exit 0
+          fi
+
+          if [ "$BUILD_RESULT" = "success" ] && { [ "$PUBLISH_RESULT" = "success" ] || [ "$PUBLISH_RESULT" = "skipped" ]; }; then
+            COLOR="#36a64f"
+            HEADER="Build successful"
+            PLAY_STATE="Google Play: uploaded to ${PLAY_TRACK} track"
+          else
+            COLOR="#FF0000"
+            HEADER="Build failed"
+            PLAY_STATE="Google Play: not published (build ${BUILD_RESULT}, publish ${PUBLISH_RESULT:-skipped})"
+          fi
+
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          STARTED_AT="$(curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            | jq -r '.run_started_at // empty' || true)"
+          DURATION="unknown"
+          if [ -n "${STARTED_AT:-}" ]; then
+            START_EPOCH="$(date -u -d "$STARTED_AT" +%s 2>/dev/null || echo 0)"
+            if [ "$START_EPOCH" != "0" ]; then
+              ELAPSED=$(( $(date -u +%s) - START_EPOCH ))
+              DURATION="$((ELAPSED / 60))m $((ELAPSED % 60))s"
+            fi
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg product "$SLACK_PRODUCT_LABEL" \
+            --arg repo "${GITHUB_REPOSITORY#*/}" \
+            --arg env "$APP_ENV" \
+            --arg ver "$VERSION_NAME" \
+            --arg code "$VERSION_CODE" \
+            --arg track "$PLAY_TRACK" \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg machine "${RUNNER_NAME:-self-hosted}" \
+            --arg dur "$DURATION" \
+            --arg play "$PLAY_STATE" \
+            --arg apk "${APK_URL:-}" \
+            --arg aab "${AAB_URL:-}" \
+            --arg logs "$RUN_URL" \
+            --arg color "$COLOR" \
+            --arg header "$HEADER" \
+            '{
+              username: ("CI · " + $product + " · " + $repo),
+              attachments: [{
+                color: $color,
+                blocks: [
+                  { type: "header",
+                    text: { type: "plain_text", text: ("🤖 [" + $product + " · Android] " + $header), emoji: true } },
+                  { type: "section",
+                    fields: [
+                      { type: "mrkdwn", text: ("*Environment:*\n" + $env) },
+                      { type: "mrkdwn", text: ("*Version:*\n" + $ver + " (" + $code + ")") },
+                      { type: "mrkdwn", text: ("*Duration:*\n" + $dur) },
+                      { type: "mrkdwn", text: ("*Branch:*\n`" + $branch + "`") },
+                      { type: "mrkdwn", text: ("*Triggered By:*\n`" + $actor + "`") },
+                      { type: "mrkdwn", text: ("*Machine:*\n`" + $machine + "`") }
+                    ] },
+                  { type: "section",
+                    text: { type: "mrkdwn", text: (
+                      "*Artifacts & Downloads:*\n" +
+                      (if $apk != "" then "📱 *APK (S3):* <" + $apk + "|Download APK>\n" else "" end) +
+                      (if $aab != "" then "📦 *AAB (S3):* <" + $aab + "|Download AAB>\n" else "" end) +
+                      "🏪 *" + $play + "*\n" +
+                      "🔗 *Logs:* <" + $logs + "|Open workflow run>"
+                    ) } }
+                ]
+              }]
+            }')
+
+          curl -sS --fail --retry 2 --retry-delay 5 -X POST \
+            -H 'Content-type: application/json' \
+            --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"

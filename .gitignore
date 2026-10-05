@@ -16,3 +16,16 @@
 local.properties
 .env
 debug.keystore
+
+# Release signing material (injected by CI from ANDROID_KEYSTORE_* secrets)
+*.jks
+*.p12
+app/google-services.json
+play-service-account.json
+
+# fastlane
+/.bundle
+/vendor/bundle
+fastlane/report.xml
+fastlane/README.md
+fastlane/Preview.html

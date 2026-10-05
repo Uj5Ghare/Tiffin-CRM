@@ -1,0 +1,126 @@
+# frozen_string_literal: true
+
+require "json"
+
+default_platform(:android)
+
+PROJECT_ROOT = File.expand_path(__dir__)
+APK_OUTPUT_DIR = File.join(PROJECT_ROOT, "app", "build", "outputs", "apk", "release")
+AAB_OUTPUT_DIR = File.join(PROJECT_ROOT, "app", "build", "outputs", "bundle", "release")
+
+def truthy?(value)
+  %w[1 true yes y on].include?(value.to_s.strip.downcase)
+end
+
+def gradle_args
+  args = []
+  args << "-PVERSION_NAME=#{ENV['VERSION_NAME']}" unless ENV["VERSION_NAME"].to_s.empty?
+  args << "-PVERSION_CODE=#{ENV['VERSION_CODE']}" unless ENV["VERSION_CODE"].to_s.empty?
+  args
+end
+
+def release_artifact(output_dir, extension)
+  metadata_file = File.join(output_dir, "output-metadata.json")
+  if File.exist?(metadata_file)
+    element = Array(JSON.parse(File.read(metadata_file))["elements"]).first
+    file = element && element["outputFile"]
+    unless file.to_s.empty?
+      artifact = File.expand_path(file, PROJECT_ROOT)
+      UI.user_error!("#{artifact} is listed in output-metadata.json but missing") unless File.exist?(artifact)
+      return { path: artifact, version_name: element["versionName"], version_code: element["versionCode"] }
+    end
+  end
+
+  candidates = Dir.glob(File.join(output_dir, "**", "*.#{extension}")).sort_by { |file| File.mtime(file) }
+  UI.user_error!("Gradle produced no #{extension.upcase} in #{output_dir}") if candidates.empty?
+  { path: File.expand_path(candidates.last, PROJECT_ROOT), version_name: nil, version_code: nil }
+end
+
+platform :android do
+  desc "Assemble the release APK and AAB and expose artifact paths and versions to the caller"
+  lane :build do
+    keystore_path = ENV["KEYSTORE_PATH"].to_s.empty? ? File.join(PROJECT_ROOT, "my-upload-key.jks") : ENV["KEYSTORE_PATH"]
+    UI.user_error!("Release keystore not found at #{keystore_path}. Set KEYSTORE_PATH / inject it in CI.") unless File.exist?(keystore_path)
+    UI.user_error!("STORE_PASSWORD is empty") if ENV["STORE_PASSWORD"].to_s.empty?
+    UI.user_error!("KEY_PASSWORD is empty") if ENV["KEY_PASSWORD"].to_s.empty?
+
+    command = [File.join(PROJECT_ROOT, "gradlew"), "clean", "assembleRelease", "bundleRelease", *gradle_args]
+    sh(command.join(" "))
+
+    apk = release_artifact(APK_OUTPUT_DIR, "apk")
+    aab = release_artifact(AAB_OUTPUT_DIR, "aab")
+
+    version_name = apk[:version_name] || ENV["VERSION_NAME"].to_s
+    version_code = apk[:version_code] || ENV["VERSION_CODE"].to_s
+    UI.user_error!("Could not resolve version name/code from #{APK_OUTPUT_DIR}/output-metadata.json") if version_name.to_s.empty? || version_code.to_s.empty?
+
+    ENV["APK_SRC"] = apk[:path]
+    ENV["AAB_SRC"] = aab[:path]
+    ENV["VERSION_NAME"] = version_name.to_s
+    ENV["VERSION_CODE"] = version_code.to_s
+
+    if ENV["GITHUB_OUTPUT"].to_s.empty?
+      UI.success("apk=#{apk[:path]}")
+      UI.success("aab=#{aab[:path]}")
+      UI.success("version=#{version_name} (code #{version_code})")
+    else
+      File.open(ENV["GITHUB_OUTPUT"], "a") do |output|
+        output.puts("apk_path=#{apk[:path]}")
+        output.puts("aab_path=#{aab[:path]}")
+        output.puts("version_name=#{version_name}")
+        output.puts("version_code=#{version_code}")
+      end
+      UI.success("APK:  #{apk[:path]}")
+      UI.success("AAB:  #{aab[:path]}")
+      UI.success("Build version #{version_name} (code #{version_code})")
+    end
+  end
+
+  desc "Upload the release AAB to Google Play on the track configured by the environment"
+  lane :upload do
+    credentials = ENV["PLAY_SERVICE_ACCOUNT_JSON"].to_s
+    UI.user_error!("PLAY_SERVICE_ACCOUNT_JSON is empty") if credentials.strip.empty?
+    begin
+      service_account = JSON.parse(credentials)
+    rescue JSON::ParserError
+      UI.user_error!("PLAY_SERVICE_ACCOUNT_JSON is not valid JSON")
+    end
+    UI.user_error!("PLAY_SERVICE_ACCOUNT_JSON has no client_email") if service_account["client_email"].to_s.empty?
+    UI.success("Play service account: #{service_account['client_email']}")
+
+    package_name = ENV["ANDROID_PACKAGE_NAME"].to_s
+    UI.user_error!("ANDROID_PACKAGE_NAME is empty") if package_name.empty?
+
+    aab = ENV["AAB_SRC"].to_s.empty? ? File.join(AAB_OUTPUT_DIR, "app-release.aab") : ENV["AAB_SRC"]
+    UI.user_error!("AAB not found at #{aab}") unless File.exist?(aab)
+
+    validate_only = truthy?(ENV["PLAY_VALIDATE_ONLY"])
+    track = ENV.fetch("PLAY_TRACK", "internal")
+
+    options = {
+      aab: aab,
+      package_name: package_name,
+      json_key_data: credentials,
+      track: track,
+      validate_only: validate_only,
+      timeout: Integer(ENV.fetch("PLAY_TIMEOUT", "900")),
+      skip_upload_metadata: true,
+      skip_upload_changelogs: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    }
+    options[:version_name] = ENV["VERSION_NAME"] unless ENV["VERSION_NAME"].to_s.empty?
+
+    rollout = ENV["PLAY_ROLLOUT"].to_s
+    fraction = rollout.empty? ? 1.0 : Float(rollout) / 100.0
+    if !validate_only && track == "production" && fraction < 1.0
+      options[:rollout] = fraction
+      options[:release_status] = "inProgress"
+    else
+      options[:release_status] = ENV.fetch("PLAY_RELEASE_STATUS", "completed")
+    end
+
+    UI.message("Play track=#{track} status=#{options[:release_status] || 'validate-only'} validate_only=#{validate_only}")
+    upload_to_play_store(**options)
+  end
+end

@@ -17,8 +17,8 @@ android {
     applicationId = "com.aistudio.tiffincrm.kxbvqz"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = (project.findProperty("VERSION_CODE") as String?)?.toIntOrNull() ?: 1
+    versionName = (project.findProperty("VERSION_NAME") as String?) ?: "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -28,14 +28,14 @@ android {
       val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
       storeFile = file(keystorePath)
       storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
+      keyAlias = System.getenv("KEY_ALIAS") ?: "upload"
       keyPassword = System.getenv("KEY_PASSWORD")
     }
     create("debugConfig") {
       storeFile = file("${rootDir}/debug.keystore")
-      storePassword = project.findProperty("DEBUG_STORE_PASSWORD") ?: "android"
+      storePassword = (project.findProperty("DEBUG_STORE_PASSWORD") as String?) ?: "android"
       keyAlias = "androiddebugkey"
-      keyPassword = project.findProperty("DEBUG_KEY_PASSWORD") ?: "android"
+      keyPassword = (project.findProperty("DEBUG_KEY_PASSWORD") as String?) ?: "android"
     }
   }
 
@@ -46,7 +46,14 @@ android {
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = signingConfigs.getByName("release")
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug {
+      signingConfig =
+        if (file("${rootDir}/debug.keystore").exists()) {
+          signingConfigs.getByName("debugConfig")
+        } else {
+          signingConfigs.getByName("debug")
+        }
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
