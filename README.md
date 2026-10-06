@@ -1,4 +1,4 @@
-# 🍱 Tiffin CRM – Smart Dabba Delivery & Subscription Management
+# 🍱 Tiffin CRM – Smart Tiffin Delivery & Subscription Management
 
 
 **Tiffin CRM** is an offline-first, mobile management suite designed for tiffin services, dabba delivery vendors, mess providers, cloud kitchens, and meal prep businesses. It replaces traditional paper notebooks and fragmented spreadsheets with a streamlined workflow for daily dispatch tracking, recurring meal subscriptions, vacation/pause schedules, customer balances, and WhatsApp communication.
@@ -514,4 +514,4 @@ app/build/reports/tests/testDebugUnitTest/index.html
 
 ## 📄 License & Credits
 
-Built with ❤️ using **Kotlin** & **Jetpack Compose**. Designed for local food entrepreneurs and tiffin services worldwide.
+Built with ❤️ using **Kotlin** & **Jetpack Compose**
